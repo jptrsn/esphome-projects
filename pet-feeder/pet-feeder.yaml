@@ -1,0 +1,499 @@
+# Temporary pointer at fork with GMT fix
+external_components:
+  - source: github://jptrsn/esphome@tuya-gmt-time
+    components: [tuya]
+
+esphome:
+  name: pet-feeder
+  friendly_name: Pet Feeder
+  includes:
+    - pet_feeder.h          # struct ScheduleCache + helpers; visible to lambdas (included after globals)
+  on_boot:
+    # After globals are restored from NVS, project the cached schedule (or the
+    # "unknown" state if nothing has ever been cached) into the slot sensors.
+    priority: -200          # run late, once sensors/scripts are set up
+    then:
+      - script.execute: decode_schedule
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+  flash_size: 4MB
+  cpu_frequency: 80MHz       # bridge doesn't need 240 MHz; 80 is the WiFi-capable floor
+
+logger:
+  # Bring-up: VERBOSE on tuya. Production: set `level: INFO` and drop the per-logger lines.
+  # The MCU's ~5 s 0x0C poll logs "[E] Invalid command (0x0C)" — harmless; `tuya: NONE` hides it.
+  level: VERBOSE
+  logs:
+    tuya: VERBOSE
+    wifi: INFO
+    api: INFO
+
+# Pulls in ArduinoJson so patch_schedule can parse the JSON patch in its lambda.
+json:
+
+# On-device web UI + REST API. The device app reads the slot sensors and
+# POSTs patches to /text/schedule_patch/set; HA reaches these too. LAN-only
+# for now — add `auth:` before exposing beyond a trusted network.
+web_server:
+  port: 80
+  version: 3
+  include_internal: true        # serve internal entities (schedule_patch) over REST
+                                # for the device UI, while keeping them out of HA
+  js_include: "pet-feeder.js"   # path relative to this yaml; embedded gzip in flash, served as /0.js
+  js_url: ""                    # suppress CDN fetch
+  css_url: ""                   # no external CSS needed; styles are injected by pet-feeder.js
+
+api:
+  encryption:
+    key: "PUT_A_BETTER_ENCRYPTION_KEY_HERE"
+  # NOTE: if your ESPHome flags `actions`, this key is `services` on older versions.
+  actions:
+    # Programmatic feed for automations/scripts (explicit portion count). The dashboard
+    # path is the Feed Amount number + Feed Now button below.
+    - action: feed_now
+      variables:
+        portions: int
+      then:
+        - lambda: |-
+            int p = portions;
+            if (p < 1 || p > 12) {
+              ESP_LOGW("feed_now", "portions %d out of range (1-12), ignoring", p);
+              return;
+            }
+            id(feeder_tuya).force_set_integer_datapoint_value(3, p);
+            ESP_LOGI("feed_now", "triggered feed of %d portion(s)", p);
+
+    # Schedule write (dp1). NOTE: this is the old array-based writer; it will be replaced
+    # by the patch_schedule op when we build the schedule CRUD foundation.
+    - action: set_meal_plan
+      variables:
+        days: int[]
+        hours: int[]
+        minutes: int[]
+        portions: int[]
+        enabled: bool[]
+      then:
+        - lambda: |-
+            size_t n = days.size();
+            if (hours.size() != n || minutes.size() != n || portions.size() != n || enabled.size() != n) {
+              ESP_LOGE("meal_plan", "all arrays must be the same length");
+              return;
+            }
+            if (n > 10) { ESP_LOGW("meal_plan", "clamping %d meals to 10", (int) n); n = 10; }
+            std::vector<uint8_t> plan;
+            for (size_t i = 0; i < n; i++) {
+              int h = hours[i], m = minutes[i], p = portions[i];
+              if (h < 0 || h > 23 || m < 0 || m > 59 || p < 1 || p > 12) {
+                ESP_LOGW("meal_plan", "meal %d out of range - skipped", (int) i);
+                continue;
+              }
+              plan.push_back((uint8_t) days[i]);
+              plan.push_back((uint8_t) h);
+              plan.push_back((uint8_t) m);
+              plan.push_back((uint8_t) p);
+              plan.push_back(enabled[i] ? 0x01 : 0x00);
+            }
+            id(feeder_tuya).set_raw_datapoint_value(1, plan);
+            ESP_LOGI("meal_plan", "wrote %d bytes (%d entries)", (int) plan.size(), (int) (plan.size() / 5));
+
+    # Partial-patch the schedule (RFC 7386 merge semantics). Reads the current
+    # schedule from the slot text_sensors, applies the patch, writes dp1. The
+    # patch is a JSON object keyed by slot "0".."9":
+    #   {"3":{"e":false}}   merge  — toggle slot 3's enable, keep its other fields
+    #   {"2":null}          delete — empty slot 2
+    #   {"5":{"d":127,"h":18,"m":0,"p":2,"e":true}}   add — fill free slot 5 (all fields)
+    - action: patch_schedule
+      variables:
+        patch: string
+      then:
+        - script.execute:
+            id: apply_schedule_patch
+            patch: !lambda 'return patch;'
+
+ota:
+  - platform: esphome
+    password: "USE_A_BETTER_OTA_PASSWORD_HERE"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  fast_connect: true
+  ap:
+    ssid: "Pet-Feeder Fallback Hotspot"
+    password: "USE_AN_AP_PASSWORD_HERE"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Persistent cache of the MCU's confirmed meal_plan (dp1). dp1 is a RAW Tuya DP:
+# the MCU won't re-serve it on a status query and there's no cloud shadow (WBR3
+# removed), so the ESP holds the last MCU-confirmed schedule, seeded only from
+# the dp1 0x07 echo and persisted to NVS so it survives reboots.
+#
+# Storage is a fixed 52-byte array, NOT a struct type, on purpose: ESPHome emits
+# `includes:` AFTER the globals block in main.cpp (a known code-gen ordering bug,
+# esphome/issues#5221), so a `type: ScheduleCache` global fails to compile --
+# the type isn't declared yet at that point. A std::array<uint8_t,N> needs no
+# user header, so it always compiles. The struct view (ScheduleCache) is overlaid
+# on these bytes inside lambdas via sched_cache(), where the header IS visible.
+# Layout: [0]=valid flag, [1]=len, [2..51]=raw dp1 bytes. See pet_feeder.h.
+globals:
+  - id: schedule_cache
+    type: std::array<uint8_t, 52>
+    restore_value: true
+    # Fresh NVS zero-inits the array -> valid byte = 0 = "unknown", which is
+    # exactly the first-boot state we want the UI to show.
+
+uart:
+  id: tuya_uart
+  tx_pin: GPIO5            # ESP -> MCU (PY32 RX)
+  rx_pin: GPIO4            # MCU -> ESP (PY32 TX)
+  baud_rate: 9600
+
+tuya:
+  id: feeder_tuya
+  uart_id: tuya_uart
+  time_id: ha_time
+  on_datapoint_update:
+    # fault bitmap (dp13) -> per-bit binary_sensors
+    - sensor_datapoint: 13
+      datapoint_type: bitmask
+      then:
+        - lambda: |-
+            id(fault_jam).publish_state((x & 0x01) != 0);
+            id(fault_low).publish_state((x & 0x02) != 0);
+            id(fault_empty).publish_state((x & 0x04) != 0);
+            id(fault_desiccant).publish_state((x & 0x08) != 0);
+            id(fault_batt_low).publish_state((x & 0x10) != 0);
+    # feed_state (dp4) enum -> read-only text_sensor
+    - sensor_datapoint: 4
+      datapoint_type: enum
+      then:
+        - lambda: |-
+            const char *s = "unknown";
+            switch (x) {
+              case 0: s = "standby"; break;
+              case 1: s = "feeding"; break;
+              case 2: s = "done"; break;
+            }
+            id(feed_state_text).publish_state(s);
+    # status / food level (dp6) enum -> read-only text_sensor
+    - sensor_datapoint: 6
+      datapoint_type: enum
+      then:
+        - lambda: |-
+            const char *s = "unknown";
+            switch (x) {
+              case 0: s = "enough"; break;
+              case 1: s = "insufficient"; break;
+              case 2: s = "run_out"; break;
+            }
+            id(food_level_text).publish_state(s);
+    # schedule (dp1, raw). The MCU echoes dp1 via 0x07 after it executes a write
+    # (report-after-execution = the write succeeded). That echo is the ONLY way
+    # we ever learn dp1 (raw DPs aren't re-served on query). So: copy the
+    # confirmed bytes into the persistent cache, then decode the cache into the
+    # slot sensors. Cache + decode are deliberately split so on_boot can reuse
+    # the same decode against the NVS-restored cache.
+    - sensor_datapoint: 1
+      datapoint_type: raw
+      then:
+        - lambda: |-
+            // store the MCU-confirmed echo as our authoritative cached schedule.
+            // sched_cache() overlays the ScheduleCache struct on the global's bytes.
+            auto &c = sched_cache(id(schedule_cache));
+            c.len = x.size() > 50 ? 50 : (uint8_t) x.size();
+            for (size_t i = 0; i < c.len; i++) c.data[i] = x[i];
+            c.valid = 1;
+        - script.execute: decode_schedule
+
+# ---- Schedule write path ---------------------------------------------------
+
+# The patch logic lives here so BOTH the patch_schedule API action and the
+# schedule_patch text entity (settable by HA and by the device web UI) share
+# one implementation. Patch format is documented on the action above.
+script:
+  # Project the cached schedule (schedule_cache global) into the 10 slot text
+  # sensors. Called from two places: the dp1 echo handler (after refreshing the
+  # cache from a confirmed write) and on_boot (against the NVS-restored cache).
+  # When the cache has never been seeded, signals UNKNOWN rather than "no meals".
+  - id: decode_schedule
+    then:
+      - lambda: |-
+          text_sensor::TextSensor *slot[10] = {
+            id(schedule_0), id(schedule_1), id(schedule_2), id(schedule_3), id(schedule_4),
+            id(schedule_5), id(schedule_6), id(schedule_7), id(schedule_8), id(schedule_9)
+          };
+          auto &c = sched_cache(id(schedule_cache));
+          // UNKNOWN: nothing has ever been confirmed from the MCU. Distinct from
+          // "no meals" (a known-empty schedule). UI shows an unknown state.
+          if (!c.valid) {
+            id(schedule_known).publish_state(false);
+            for (int i = 0; i < 10; i++) slot[i]->publish_state("");
+            return;
+          }
+          id(schedule_known).publish_state(true);
+          for (int i = 0; i < 10; i++) {
+            size_t o = (size_t) i * 5;
+            // slot absent: cache shorter than this position (e.g. FF:FF:FF marker)
+            if (o + 5 > c.len) { slot[i]->publish_state(""); continue; }
+            uint8_t d = c.data[o], h = c.data[o+1], m = c.data[o+2],
+                    p = c.data[o+3], e = c.data[o+4];
+            // inert sentinel / not a real meal -> empty slot
+            if (d == 0 || p < 1 || p > 12) { slot[i]->publish_state(""); continue; }
+            char buf[48];
+            snprintf(buf, sizeof(buf),
+                     "{\"d\":%u,\"h\":%u,\"m\":%u,\"p\":%u,\"e\":%s}",
+                     (unsigned) d, (unsigned) h, (unsigned) m, (unsigned) p,
+                     e ? "true" : "false");
+            slot[i]->publish_state(buf);
+          }
+
+  - id: apply_schedule_patch
+    parameters:
+      patch: string
+    then:
+      - lambda: |-
+          struct Slot { bool present; int d, h, m, p; bool e; };
+          Slot slot[10];
+          text_sensor::TextSensor *ts[10] = {
+            id(schedule_0), id(schedule_1), id(schedule_2), id(schedule_3), id(schedule_4),
+            id(schedule_5), id(schedule_6), id(schedule_7), id(schedule_8), id(schedule_9)
+          };
+          // 1) current schedule, read back from the decode projection
+          for (int i = 0; i < 10; i++) {
+            slot[i] = {false, 0, 0, 0, 0, false};
+            int d, h, m, p; char eb[8];
+            if (sscanf(ts[i]->state.c_str(),
+                       "{\"d\":%d,\"h\":%d,\"m\":%d,\"p\":%d,\"e\":%7[a-z]}",
+                       &d, &h, &m, &p, eb) == 5) {
+              slot[i] = {true, d, h, m, p, strcmp(eb, "true") == 0};
+            }
+          }
+          // 2) apply the patch onto that current state
+          bool ok = json::parse_json(patch, [&](JsonObject root) -> bool {
+            for (JsonPair kv : root) {
+              const char *k = kv.key().c_str();
+              if (k[0] < '0' || k[0] > '9' || k[1] != '\0') {
+                ESP_LOGW("patch", "bad slot key '%s', skipped", k); continue;
+              }
+              int i = k[0] - '0';
+              if (kv.value().isNull()) { slot[i].present = false; continue; }   // delete
+              JsonObject o = kv.value().as<JsonObject>();
+              if (o.isNull()) { ESP_LOGW("patch", "slot %d: not an object, skipped", i); continue; }
+              if (!slot[i].present) {  // new meal -> all fields required (nothing to merge onto)
+                if (!(o["d"].is<int>() && o["h"].is<int>() && o["m"].is<int>() &&
+                      o["p"].is<int>() && o["e"].is<bool>())) {
+                  ESP_LOGW("patch", "slot %d: new meal needs d,h,m,p,e - skipped", i); continue;
+                }
+                slot[i].present = true;
+              }
+              if (o["d"].is<int>())  slot[i].d = o["d"].as<int>();
+              if (o["h"].is<int>())  slot[i].h = o["h"].as<int>();
+              if (o["m"].is<int>())  slot[i].m = o["m"].as<int>();
+              if (o["p"].is<int>())  slot[i].p = o["p"].as<int>();
+              if (o["e"].is<bool>()) slot[i].e = o["e"].as<bool>();
+            }
+            return true;
+          });
+          if (!ok) { ESP_LOGE("patch", "invalid JSON patch, aborting"); return; }
+          // 3) validate every present slot; one bad slot aborts the whole write
+          for (int i = 0; i < 10; i++) {
+            if (!slot[i].present) continue;
+            if (slot[i].d < 1 || slot[i].d > 127 || slot[i].h < 0 || slot[i].h > 23 ||
+                slot[i].m < 0 || slot[i].m > 59 || slot[i].p < 1 || slot[i].p > 12) {
+              ESP_LOGE("patch", "slot %d invalid after patch (d=%d h=%d m=%d p=%d), aborting",
+                       i, slot[i].d, slot[i].h, slot[i].m, slot[i].p);
+              return;
+            }
+          }
+          // 4) encode: positions 0..highest; internal gaps as inert 00-sentinel,
+          //    trailing empties trimmed (keeps slot == dp1 position stable)
+          int highest = -1;
+          for (int i = 0; i < 10; i++) if (slot[i].present) highest = i;
+          std::vector<uint8_t> out;
+          if (highest < 0) {
+            out = {0xFF, 0xFF, 0xFF};   // no meals -> the device's "no schedule" marker
+          } else {
+            for (int i = 0; i <= highest; i++) {
+              if (slot[i].present) {
+                out.push_back((uint8_t) slot[i].d);
+                out.push_back((uint8_t) slot[i].h);
+                out.push_back((uint8_t) slot[i].m);
+                out.push_back((uint8_t) slot[i].p);
+                out.push_back(slot[i].e ? 0x01 : 0x00);
+              } else {
+                out.insert(out.end(), {0, 0, 0, 0, 0});   // inert sentinel holds the position
+              }
+            }
+          }
+          // 5) write (force so an unchanged blob still lands on the MCU)
+          id(feeder_tuya).force_set_raw_datapoint_value(1, out);
+          ESP_LOGI("patch", "wrote %d byte(s) to dp1 (highest slot %d)", (int) out.size(), highest);
+
+# Writable patch ingress for the device web UI, which POSTs JSON to
+# /text/schedule_patch/set. Marked internal so it does NOT appear in HA (the raw
+# JSON field is unusable by hand there); web_server include_internal keeps it
+# reachable over the device's REST. HA writes go through the patch_schedule API
+# action instead, which runs the same script.
+text:
+  - platform: template
+    name: "Schedule Patch"
+    id: schedule_patch
+    internal: true
+    mode: text
+    optimistic: true
+    set_action:
+      - script.execute:
+          id: apply_schedule_patch
+          patch: !lambda 'return x;'
+
+# ---- Controls -------------------------------------------------------------
+
+# Feed Amount is a LOCAL setpoint (1-12). Changing it does NOT feed — it only
+# stores how much the next manual feed will dispense. Not bound to dp3.
+number:
+  - platform: template
+    name: "Feed Amount"
+    id: feed_amount
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 12
+    step: 1
+    unit_of_measurement: "portions"
+    mode: box
+    icon: "mdi:bowl-mix"
+
+# Feed Now is the trigger: it dispenses the current Feed Amount via force_set
+# (dp3), which always sends even when the value is unchanged.
+button:
+  - platform: template
+    name: "Feed Now"
+    icon: "mdi:bowl"
+    on_press:
+      - lambda: |-
+          int amount = (int) id(feed_amount).state;
+          if (amount < 1 || amount > 12) amount = 1;
+          id(feeder_tuya).force_set_integer_datapoint_value(3, amount);
+          ESP_LOGI("feed_now", "manual feed of %d portion(s)", amount);
+
+# ---- Telemetry (read-only) -------------------------------------------------
+
+sensor:
+  - platform: tuya
+    name: "Battery"
+    sensor_datapoint: 10
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+
+  - platform: tuya
+    name: "Last Feed Amount"
+    sensor_datapoint: 14
+    unit_of_measurement: "portions"
+    state_class: measurement
+    filters:
+      - lambda: |-
+          if (x == 0) return {};   // drop the MCU's post-feed reset; hold the last real amount
+          return x;
+
+text_sensor:
+  - platform: template
+    id: feed_state_text
+    name: "Feed State"
+    icon: "mdi:state-machine"
+  - platform: template
+    id: food_level_text
+    name: "Food Level"
+    icon: "mdi:food-drumstick"
+
+  # Schedule slots 0-9, decoded from the cache by decode_schedule. Each holds one
+  # meal's JSON or "" (empty slot). internal: true keeps them OFF the HA dashboard
+  # (the raw JSON is not user-friendly); web_server include_internal still serves
+  # them over the device REST, which is how the UI reads the schedule.
+  - platform: template
+    id: schedule_0
+    name: "Schedule Slot 0"
+    internal: true
+  - platform: template
+    id: schedule_1
+    name: "Schedule Slot 1"
+    internal: true
+  - platform: template
+    id: schedule_2
+    name: "Schedule Slot 2"
+    internal: true
+  - platform: template
+    id: schedule_3
+    name: "Schedule Slot 3"
+    internal: true
+  - platform: template
+    id: schedule_4
+    name: "Schedule Slot 4"
+    internal: true
+  - platform: template
+    id: schedule_5
+    name: "Schedule Slot 5"
+    internal: true
+  - platform: template
+    id: schedule_6
+    name: "Schedule Slot 6"
+    internal: true
+  - platform: template
+    id: schedule_7
+    name: "Schedule Slot 7"
+    internal: true
+  - platform: template
+    id: schedule_8
+    name: "Schedule Slot 8"
+    internal: true
+  - platform: template
+    id: schedule_9
+    name: "Schedule Slot 9"
+    internal: true
+
+binary_sensor:
+  # True once the ESP has learned the schedule from a confirmed MCU dp1 echo;
+  # false on a fresh device whose NVS cache has never been seeded. The UI reads
+  # this to show an "unknown schedule" state instead of a misleading "no meals".
+  - platform: template
+    id: schedule_known
+    name: "Schedule Known"
+
+  # fault bitmap (dp13) — fed by the on_datapoint_update lambda above.
+  # device_class: problem on all (so the device's aggregate problem state is
+  # honest). The two "advance warning" faults are also entity_category:
+  # diagnostic so they sit in HA's diagnostic section rather than the main view.
+  - platform: template
+    id: fault_jam
+    name: "Fault: Food Jam"
+    device_class: problem
+  - platform: template
+    id: fault_low
+    name: "Fault: Food Low"
+    device_class: problem
+    entity_category: diagnostic       # advance warning, not act-now
+  - platform: template
+    id: fault_empty
+    name: "Fault: Hopper Empty"
+    device_class: problem
+  - platform: template
+    id: fault_desiccant
+    name: "Fault: Desiccant Spent"
+    device_class: problem
+  - platform: template
+    id: fault_batt_low
+    name: "Fault: Battery Low"
+    device_class: problem
+    entity_category: diagnostic       # degraded state, but not urgent
+
+# factory_reset (dp24, bool) intentionally omitted to avoid an accidental wipe.
